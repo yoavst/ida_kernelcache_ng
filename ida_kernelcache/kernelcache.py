@@ -68,6 +68,10 @@ class KernelCache(object):
         self.class_info_map = self.rtti_db.class_info_map
         self.vmethod_info_map = self.rtti_db.vmethod_info_map
 
+        # Populated by CollectClasses from the ipsw `VtableAddr` field and consumed by CollectVtables.
+        # Maps metaclass_ea -> the address of the first vmethod of the class vtable (ipsw VtableAddr).
+        self.metaclass_to_vtable_ea: dict[int, int] = {}
+
         self.segments_list: list[Segment] = []
         self._kexts: list[Kext] = []
 

@@ -1,248 +1,96 @@
 """
+Collect C++ class / metaclass information from a kernelcache.
+
 Useful references:
 
 - https://developer.apple.com/documentation/kernel/osmetaclassbase
 - https://developer.apple.com/library/archive/documentation/DeviceDrivers/Conceptual/WritingDeviceDriver/CPluPlusRuntime/CPlusPlusRuntime.html
+
+Historically this phase reconstructed the RTTI graph by locating OSMetaClass::OSMetaClass and
+inspecting the Hex-Rays ctree of every call site. That approach kept breaking whenever Apple shipped
+a kernel that IDA's ARM64 decompiler couldn't fully digest. We now delegate class discovery to
+`ipsw kernel cpp --json`, which parses the kernelcache directly and hands us the complete class
+graph (see ida_kernelcache.ida_helpers.ipsw).
 """
-import collections
-import re
-
-import idc
-import idautils
-import ida_xref
-import ida_hexrays
-
 from .base_phase import BasePhase
-from ida_kernelcache import rtti, symbols
-from ida_kernelcache.exceptions import PhaseException
+from ida_kernelcache import rtti
 from ida_kernelcache.utils import OneToOneMapFactory
-
-import ida_kernelcache.ida_helpers.decompiler as decompiler
-import ida_kernelcache.ida_helpers.names as names
-import ida_kernelcache.ida_helpers as ida_helpers
-from ..consts import OSMETACLASS_CTOR_SYMBOL
-from ..ida_helpers import strings, functions
+from ida_kernelcache.ida_helpers import ipsw
 
 
 class CollectClasses(BasePhase):
     """
     Collect information about C++ classes defined in a kernelcache. Arm64 only.
 
-    This function searches through an iOS kernelcache for information about the C++ classes defined
-    in it. It populates the KernelCache's class_info_map, which maps the C++ class names and metaclass eas to a
-    ClassInfo object containing meta-information about the class.
+    Populates the KernelCache's class_info_map, which maps the C++ class names and metaclass eas to a
+    ClassInfo object containing meta-information about the class. The class vtable addresses reported
+    by ipsw are stashed on ``KernelCache.metaclass_to_vtable_ea`` for the CollectVtables phase.
 
-    Every run of this phase will clear the class_info_map and re-evaluate it.
-
-    TODO: I dropped support for looking for virtual tables that are not used by any class in the kernelcache. How many are there? Are they useful?
-    This function also collects the set of all virtual method tables identified in the kernelcache,
-    even if the corresponding class could not be identified. A mapping from each virtual method
-    table to its length is stored in the global vtables variable.
-
-    TODO: An example to a nested class that is interesting and we are missing ..?
-    Only top-level classes are processed. Information about nested classes is not collected.
+    Every run of this phase clears the class_info_map and re-evaluates it.
     """
-    NUM_EXPECTED_ARGS = 4
     CLASS_BLACKLIST = ['AppleBasebandPCIMessageQueueBase']
     TEMPLATE_BLACKLIST = ['OSValueObject']  # TODO: handling templates in name mangling has to be done first
 
     def __init__(self, kc):
         super().__init__(kc)
 
-        self.osmetaclass_constructor_ea: int
         # Collect associations from class names to metaclass instances and vice versa.
-
         self._metaclass_to_classname_builder = OneToOneMapFactory()
         self._metaclass_to_class_size = {}
         self._metaclass_to_super_metaclass = {}
-        self._visited: set[int] = set()
         self._blacklisted: set[str] = set()
-        self._var_expr_errors = collections.defaultdict(set)
 
         # Statistics
-        self._num_xrefs = 0
-        self._num_failed = 0
         self._num_succeeded = 0
-        self._num_duplicates = 0
-        self._num_unique_unresolved = 0
         self._num_dropped_in_one_to_one_map = 0
 
     def run(self):
         # Clear out old class information
         self._kc.class_info_map.clear()
-        self._find_osmetaclass_constructor()
-        self._collect_metaclasses()
+        self._kc.metaclass_to_vtable_ea.clear()
+
+        self._load_from_ipsw()
         self._populate_class_info_map()
-
-        for classname_str, errors_ea_set in self._var_expr_errors.items():
-            # Don't print errors for classes who we blacklisted
-            if classname_str in self._blacklisted:
-                continue
-
-            if classname_str in self._kc.class_info_map:
-                # Don't consider those as failures in the statistics because we got the class info from somewhere else
-                self._num_failed -= len(errors_ea_set)
-                self._num_duplicates += len(errors_ea_set)
-            else:
-                self.log.error(f'Unresolved {classname_str}: {", ".join(f"{ea:#x}" for ea in errors_ea_set)}')
-                self._num_unique_unresolved += 1
 
         # Print statistics
         self.log.info(f'Collection stats:\n'
-                      f'* total:{self._num_xrefs} xrefs in {len(self._visited)} unique functions\n'
-                      f'* succeeded:{self._num_succeeded} xrefs\n'
-                      f'* failed:{self._num_failed} xrefs, a total of {self._num_unique_unresolved} unresolved classes\n'
-                      f'* duplicates:{self._num_duplicates}\n'
+                      f'* classes from ipsw:{self._num_succeeded}\n'
                       f'* dropped in one-to-one map:{self._num_dropped_in_one_to_one_map}\n'
                       f'* blacklisted:{len(self._blacklisted)}\n'
                       f'* classes:{len(self._kc.class_info_map)}\n')
 
-    def _find_osmetaclass_constructor(self):
+    def _load_from_ipsw(self):
         """
-        Locate OSMetaClass::OSMetaClass function. We do this by finding the first reference to the OSObject string
+        Run `ipsw kernel cpp --json` and load the discovered class graph into the intermediate maps
+        that _populate_class_info_map() consumes.
         """
-        osobject_str_ea = strings.find_str("OSObject").ea
+        classes = ipsw.run_kernel_cpp()
+        self.log.info(f'ipsw reported {len(classes)} classes')
 
-        # Surprisingly this hack works.. the first dref is the OSMetaClass::OSMetaClass constructor we are looking for
-        OSObject_xref = ida_xref.get_first_dref_to(osobject_str_ea)
+        for entry in classes:
+            class_name = entry['Name']
+            metaclass_ea = entry['MetaPtr']
+            class_size = entry['Size']
+            super_metaclass_ea = entry['SuperMeta']
+            vtable_addr = entry['VtableAddr']
 
-        # Decompile the method using hexrays
-        cfunc = ida_hexrays.decompile(OSObject_xref)
-        if cfunc is None:
-            raise PhaseException("hexrays decompilation failed! did IDA finish processing the kernel yet?")
+            if not metaclass_ea:
+                self.log.warning(f'Skipping {class_name}: ipsw reported a null MetaPtr')
+                continue
 
-        visitor = decompiler.FindCallByArgVisitor(osobject_str_ea)
-        visitor.apply_to(cfunc.body, parent=None)
+            self._metaclass_to_classname_builder.add_link(metaclass_ea, class_name)
+            self._metaclass_to_class_size[metaclass_ea] = class_size
 
-        if not visitor.found:
-            raise PhaseException("Failed to find OSMetaclass::OSMetaclass ea!")
+            # Only store information for non-null super metaclasses (root classes have SuperMeta == 0)
+            if super_metaclass_ea:
+                self._metaclass_to_super_metaclass[metaclass_ea] = super_metaclass_ea
 
-        self.osmetaclass_constructor_ea = visitor.func_ea
-        self.log.info(f'Found OSMetaClass::OSMetaClass {self.osmetaclass_constructor_ea:#x}')
-        names.set_ea_name(self.osmetaclass_constructor_ea, OSMETACLASS_CTOR_SYMBOL)
+            # ipsw's VtableAddr points at the first vmethod. Classes without a vtable (== 0) are
+            # "optimized" and are handled as such by CollectVtables.
+            if vtable_addr:
+                self._kc.metaclass_to_vtable_ea[metaclass_ea] = vtable_addr
 
-    def _find_osmetaclass_constructor_with_zone(self):
-        # TODO: Finish this implementation!
-        try:
-            iosurface_str_ea = strings.find_str("IOSurface").ea
-        except StopIteration:
-            raise PhaseException("Couldn't find OSObject str")
-
-        visitor = decompiler.FindCallByArgVisitor(iosurface_str_ea)
-
-        for xref_ea in idautils.DataRefsTo(iosurface_str_ea):
-            func_start_ea = functions.get_func_start(xref_ea)
-
-            # Decompile the method using hexrays
-            cfunc = ida_hexrays.decompile(func_start_ea)
-            if cfunc is None:
-                raise PhaseException("hexrays decompilation failed! did IDA finish processing the kernel yet?")
-            visitor.apply_to(cfunc.body, parent=None)
-
-        if not visitor.found:
-            raise PhaseException("Failed to find OSMetaclass::OSMetaclass ea!")
-
-        self.osmetaclass_constructor_ea = visitor.func_ea
-        self.log.info(f'Found OSMetaClass::OSMetaClass {self.osmetaclass_constructor_ea:#x}')
-        names.set_ea_name(self.osmetaclass_constructor_ea, OSMETACLASS_CTOR_SYMBOL)
-
-    def _collect_metaclasses(self):
-        """
-        Collect OSMetaClass information from all kexts in the kernelcache.
-        """
-        old = idc.batch(1)
-
-        try:
-            # There are ~300 data refs in __auth_got segments however they do not seem to be used at all so I intentionally
-            # choose to skip them.
-            for xref_ea in idautils.CodeRefsTo(self.osmetaclass_constructor_ea, flow=False):
-                self._num_xrefs += 1
-                func_start_ea = functions.get_func_start_or_try_create(xref_ea)
-                self._visited.add(func_start_ea)
-                if self._handle_callsite(xref_ea):
-                    self._num_succeeded += 1
-                else:
-                    self._num_failed += 1
-
-        finally:
-            idc.batch(old)
-
-    def _handle_callsite(self, ea: int, must_find_call: bool = True) -> bool:
-        args_ops = [
-            (ida_hexrays.cot_cast, ida_hexrays.cot_ref, ida_hexrays.cot_var),
-            (ida_hexrays.cot_obj,),
-            (ida_hexrays.cot_cast, ida_hexrays.cot_ref, ida_hexrays.cot_num),
-            (ida_hexrays.cot_num,)
-        ]
-
-        visitor = decompiler.FindCallVisitor(self.osmetaclass_constructor_ea, ea, args_ops)
-        cfunc = ida_hexrays.decompile(ea)
-        if cfunc is None:
-            self.log.error(f'hexrays decompilation failed at {ea:#x}')
-            return False
-
-        visitor.apply_to(cfunc.body, parent=None)
-        if not visitor.found:
-
-            # don't spam error logs for mod_init functions that are not related to global objects
-            if must_find_call:
-                self.log.error(f'Failed to find OSMetaClass::OSMetaClass call site in the ctree {ea:#x}')
-            return False
-
-        if not visitor.passed_ops_validation:
-            self.log.error(f'Failed ops validations! ops:[{", ".join(str(a.op) for a in visitor.args)}] {ea:#x}')
-            return False
-
-        # Make sure that the classname is within a cstring section and then read its contents
-        classname_ea = visitor.args[1].obj_ea
-        if not re.match(r".*__(cstring|const)$", idc.get_segm_name(classname_ea)):
-            self.log.error(f'arg[1] does not belong in a __cstring/__const segment! ea:{ea:#x} classname_ea:{classname_ea:#x}')
-            return False
-
-        classname_str = idc.get_strlit_contents(classname_ea).decode()
-        metaclass_arg = decompiler.traverse_casts_or_ref_branch(visitor.args[0])
-        match metaclass_arg.op:
-            case ida_hexrays.cot_var:
-
-                # Seems like there are a lot of useless constructors that are not used, we cannot find their corresponding
-                # metaclass because it is passed as a variable instead of a reference.
-                # Usually for those there will be some other valid xref to this classname. So the approach I took here is to
-                # only inform the user of these errors after finishing collecting from all possible sources
-                # Fail silently and only check later
-                self._var_expr_errors[classname_str].add(ea)
-                return False
-            case ida_hexrays.cot_obj:
-                metaclass_ea = metaclass_arg.obj_ea
-            case _:
-                self.log.error(f'unexpected ctree structure arg[0] branch did not lead to cot_obj! ea:{ea:#x}')
-                return False
-
-        super_metaclass_arg = decompiler.traverse_casts_or_ref_branch(visitor.args[2])
-        match super_metaclass_arg.op:
-            case ida_hexrays.cot_num:
-                if super_metaclass_arg.numval():
-                    self.log.error(f'arg[2] is a non-zero numeric value! ea:{ea:#x}')
-                    return False
-                super_metaclass_ea = 0
-            case ida_hexrays.cot_obj:
-                super_metaclass_ea = super_metaclass_arg.obj_ea
-            case _:
-                self.log.error(f'unexpected ctree structure arg[0] branch did not lead to cot_obj! ea:{ea:#x}')
-                return False
-
-        # fourth argument is always cot_numval
-        class_size = visitor.args[3].numval()
-
-        # We found valid information. record it
-        self.log.debug(f"Found metaclass info for {classname_str} at {ea:#x}")
-
-        self._metaclass_to_classname_builder.add_link(metaclass_ea, classname_str)
-        self._metaclass_to_class_size[metaclass_ea] = class_size
-
-        # Only store information for non-null values!
-        if super_metaclass_ea:
-            self._metaclass_to_super_metaclass[metaclass_ea] = super_metaclass_ea
-        return True
+            self._num_succeeded += 1
 
     def _populate_class_info_map(self):
         """
@@ -295,7 +143,9 @@ class CollectClasses(BasePhase):
 
             # For subclasses make sure that we haven't dropped the superclass in the one-to-one map building process
             if super_metaclass_ea not in one_to_one_map:
-                raise PhaseException(f'Superclass not in one-to-one map but subclass is! {super_metaclass_ea:#x} {metaclass_ea:#x} {class_name}')
+                self.log.warning(f'Superclass {super_metaclass_ea:#x} of {class_name} was dropped from the '
+                                 f'one-to-one map; treating {class_name} as a root class')
+                continue
 
             superclass_info = self._kc.class_info_map[super_metaclass_ea]
 

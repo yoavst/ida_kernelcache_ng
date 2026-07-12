@@ -29,7 +29,9 @@ def create_type_from_decl(type_decl: str, replace: bool = False):
         pt_flags |= ida_typeinf.PT_REPLACE
     num_errors = ida_typeinf.idc_parse_types(type_decl, pt_flags)
     if num_errors:
-        raise FailedToCreateTypeError(f'Got {num_errors} num errors')
+        raise FailedToCreateTypeError(
+            f'Got {num_errors} num errors while parsing type declaration '
+            f'(see the Output window for the parser errors):\n{type_decl}')
 
 
 class LocalType:

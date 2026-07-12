@@ -2,13 +2,19 @@
 Refer to: https://docs.hex-rays.com/user-guide/user-interface/menu-bar/view/c++-type-details
 This is why I set the EA as struct member comments: https://hex-rays.com/blog/igor-tip-of-the-week-15-comments-in-structures-and-enums
 """
+import re
+
 import ida_kernwin
 import ida_typeinf
 
 from ida_kernelcache import consts, symbols
-from ida_kernelcache.exceptions import PhaseException
+from ida_kernelcache.exceptions import PhaseException, FailedToCreateTypeError
 from ida_kernelcache.ida_helpers import types
 from .base_phase import BasePhase
+
+# A C struct member must be a plain identifier. Demangled C++ method names can be operators or
+# destructors (e.g. 'operator new', '~OSObject') which are not valid identifiers.
+_VALID_C_IDENTIFIER = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 
 class CreateTypes(BasePhase):
@@ -82,7 +88,7 @@ class CreateTypes(BasePhase):
 
             # Skip creation of vtable types for optimized classes (without vtables)
             if class_info.optimized:
-                types.create_type_from_decl(f'{cls_type_decl}', replace=True)
+                self._create_type_from_decl(class_info, cls_type_decl)
                 class_local_type = types.LocalType(class_info.class_name)
                 self.log.info(f'{class_info.class_name} is an optimized class without a vtable! Class type ordinal: {class_local_type.ordinal}')
                 continue
@@ -98,7 +104,16 @@ class CreateTypes(BasePhase):
 
                 if not vtable_entry.pure_virtual and vtable_entry.vmethod_info.mangled_symbol:
                     # Might raise StringExtractionError or DemanglingError
-                    func_name = symbols.extract_method_name(vtable_entry.vmethod_info.mangled_symbol)
+                    extracted = symbols.extract_method_name(vtable_entry.vmethod_info.mangled_symbol)
+
+                    # Demangled names can be operators or destructors (e.g. 'operator new',
+                    # '~OSObject') which are not valid C struct member identifiers. Keep the generic
+                    # vmethod_{index} name in that case so the type declaration still parses.
+                    if _VALID_C_IDENTIFIER.match(extracted):
+                        func_name = extracted
+                    else:
+                        self.log.debug(f'{class_info.class_name} vmethod {vtable_entry.index} has non-identifier '
+                                       f'name {extracted!r}; falling back to {func_name}')
 
                 # TODO: IDA has a bug that does will fail to parse vtable declaration if two vmethods have the same name,
                 #  even if they have a different signature.
@@ -121,7 +136,7 @@ class CreateTypes(BasePhase):
                 virtual_funcs=consts.FIELD_SEP.join(func_decls),
             )
 
-            types.create_type_from_decl(f'{cls_type_decl}\n{vtbl_type_decl}', replace=True)
+            self._create_type_from_decl(class_info, f'{cls_type_decl}\n{vtbl_type_decl}')
             vtable_local_type = types.LocalType(f'{class_info.class_name}_vtbl')
             vtable_local_type.udt.set_vftable(True)
             ida_typeinf.set_vftable_ea(vtable_local_type.ordinal, class_info.vtable_info.vtable_ea)
@@ -137,3 +152,16 @@ class CreateTypes(BasePhase):
         self.log.info(f'{num_created} new class types created!')
         self.log.info(f'{num_vtbl_types} new vtable types created!')
         self.log.info(f'{func_name_conflicts} function name conflicts!')
+
+    def _create_type_from_decl(self, class_info, type_decl: str):
+        """
+        Wrapper around types.create_type_from_decl that logs the offending class and declaration when
+        parsing fails, so the failure is easy to debug (the parser errors themselves are printed by
+        IDA to the Output window).
+        """
+        try:
+            types.create_type_from_decl(type_decl, replace=True)
+        except FailedToCreateTypeError:
+            self.log.error(f'Failed to create type for {class_info.class_name} '
+                           f'(metaclass_ea={class_info.metaclass_ea:#x}). Offending declaration:\n{type_decl}')
+            raise
