@@ -255,15 +255,41 @@ class CreateTypes(BasePhase):
         if kcu.is_available():
             view = kcu.best_kalloc_view(class_info.class_name, class_info.class_size)
 
-        decls = []
+        kinds = []
         for offset in range(start_offset, class_info.class_size, consts.WORD_SIZE):
             kind = view.granule_kind(offset) if view is not None else 0
-            if kind & (kcu.GRANULE_PTR | kcu.GRANULE_PAC):
-                decls.append(consts.PTR_FIELD_TEMPLATE.format(offset=offset))
-            elif kind & kcu.GRANULE_DUAL:
-                decls.append(consts.PTR_FIELD_TEMPLATE.format(offset=offset) + ' ///< dual granule')
+            if kind & kcu.GRANULE_DUAL:
+                kinds.append(('ptr', ' ///< dual granule'))
+            elif kind & (kcu.GRANULE_PTR | kcu.GRANULE_PAC):
+                kinds.append(('ptr', ''))
             else:
-                decls.append(consts.DATA_FIELD_TEMPLATE_HEX.format(offset=offset))
+                kinds.append(('data', ''))
+
+        # Collapse runs of the same kind. Embedded buffers can be hundreds of KB;
+        # one member per granule would create tens of thousands of members.
+        decls = []
+        index = 0
+        while index < len(kinds):
+            kind, comment = kinds[index]
+            run_end = index + 1
+            while run_end < len(kinds) and kinds[run_end][0] == kind:
+                run_end += 1
+            run_length = run_end - index
+            offset = start_offset + index * consts.WORD_SIZE
+
+            if run_length > consts.FIELD_RUN_COLLAPSE_THRESHOLD:
+                if kind == 'ptr':
+                    decls.append(f'void *ptr_{offset:02x}[{run_length}];{comment}')
+                else:
+                    decls.append(f'unsigned __int64 data_{offset:02x}[{run_length}];')
+            else:
+                for step in range(run_length):
+                    member_offset = offset + step * consts.WORD_SIZE
+                    if kind == 'ptr':
+                        decls.append(consts.PTR_FIELD_TEMPLATE.format(offset=member_offset) + comment)
+                    else:
+                        decls.append(consts.DATA_FIELD_TEMPLATE_HEX.format(offset=member_offset))
+            index = run_end
         return decls
 
     def _create_type_from_decl(self, class_info, type_decl: str, replace: bool = False):

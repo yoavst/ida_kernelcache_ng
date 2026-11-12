@@ -30,6 +30,8 @@ VPTR_FIELD = 'void *__vftable;'
 DATA_FIELD_TEMPLATE = '__int64 field_{offset:#04x};'
 PTR_FIELD_TEMPLATE = 'void *ptr_{offset:02x};'
 DATA_FIELD_TEMPLATE_HEX = 'unsigned __int64 data_{offset:02x};'
+# Runs longer than this become one array member instead of one member per granule.
+FIELD_RUN_COLLAPSE_THRESHOLD = 300
 
 # TODO: don't need these members in the vtable?
 # unsigned __int64 this_offset;

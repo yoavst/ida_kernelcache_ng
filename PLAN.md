@@ -86,3 +86,9 @@ Measured facts this plan is based on:
   - Virtual calls now resolve to named vtable slots of the static base type
     (`AppleIOP_vtbl`), not raw `*(_QWORD *)a1 + N` offsets.
   - Auto-generated `vmethod_N` names no longer overwrite real symbol names.
+- Field layout: runs of the same granule kind are collapsed into one array member
+  only when the run is longer than `FIELD_RUN_COLLAPSE_THRESHOLD` (300 granules).
+  Shorter runs stay one member per granule.
+- idalib note: `import idapro` rewrites `sys.path`; scripts must re-add the plugin
+  root after importing it. `ida_helpers/paths.py` resolves the input file when
+  `ida_nalt.get_input_file_path()` returns None.

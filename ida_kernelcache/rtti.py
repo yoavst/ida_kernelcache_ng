@@ -23,7 +23,7 @@ import idc
 
 from ida_kernelcache import consts, utils
 from ida_kernelcache.exceptions import ClassHasVtableError, VtableHasClassError, PhaseException
-from ida_kernelcache.ida_helpers import generators, functions
+from ida_kernelcache.ida_helpers import generators, functions, paths
 
 log = logging.getLogger(__name__)
 
@@ -540,7 +540,7 @@ class RTTIDatabase:
     def __init__(self):
         self.class_info_map = ClassInfoMap()
         self.vmethod_info_map = VMethodInfoMap()
-        input_path = ida_nalt.get_input_file_path() or ida_nalt.get_root_filename() or 'kernelcache'
+        input_path = paths.input_file_path() or 'kernelcache'
         self.persistent_path = pathlib.Path(input_path + self.RTTI_DB_SUFFIX)
 
     def save(self):
