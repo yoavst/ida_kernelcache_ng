@@ -92,3 +92,25 @@ Measured facts this plan is based on:
 - idalib note: `import idapro` rewrites `sys.path`; scripts must re-add the plugin
   root after importing it. `ida_helpers/paths.py` resolves the input file when
   `ida_nalt.get_input_file_path()` returns None.
+
+## Full verification (IDA 9.5.261026, all KEXTs)
+
+Fresh DB from a copy, `IDA_KCACHE_ALL=1`, full auto-analysis. Phases:
+CollectClasses, CollectVtables, IPSWSymbolicate (41007 symbols), CreateTypes,
+ApplyRTTIInfo, ColorizeVtables.
+
+- Open: 463 s. Phases: 165 s.
+- Classes: 2953 reported by ipsw -> 2897 in the map (54 `OSValueObject<...>`
+  templates blacklisted, 2 duplicate metaclass registrations dropped).
+- With vtable: 2874. Optimized: 23. Vmethods: 40561.
+- Names: 2897 `X::gMetaClass`, 2874 `X::vtable`.
+- Types: 2897 `__cppobj` class types, all with a base; 2873 vtable data types
+  (every vtable except `OSMetaClass`, which CreateTypes skips on purpose).
+- Vtable type creation: 2499 created, 374 kept, 0 failures. 61 classes fell back
+  to generic `Class *self` slots because their mangled argument types were not in
+  the local type library.
+- Spot checks: `AppleA7IOP : AppleIOP` (392), `IOWatchdog : IOService` (248),
+  `AppleASCWrapV4 : AppleA7IOP` (424), `OSArray : OSCollection` (40, vtbl 38),
+  `IOService : IORegistryEntry` (136).
+- `AppleA7IOP::start` decompiles as
+  `__int64 AppleA7IOP::start(AppleA7IOP *self, IOService *a2)`.
