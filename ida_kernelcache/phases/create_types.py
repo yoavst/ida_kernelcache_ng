@@ -176,8 +176,7 @@ class CreateTypes(BasePhase):
         )
         return decl, slots, conflicts
 
-    @staticmethod
-    def _slot_signature(class_info, vtable_entry) -> str:
+    def _slot_signature(self, class_info, vtable_entry) -> str:
         """Build the slot signature, adding real arguments from the mangled symbol."""
         func_sig = f'{class_info.class_name} *self'
         mangled = vtable_entry.vmethod_info.mangled_symbol if vtable_entry.vmethod_info else None
