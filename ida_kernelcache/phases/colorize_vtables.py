@@ -45,7 +45,9 @@ class ColorizeVtables(BasePhase):
                 # Unless IDA provides some API which is similar to set_array_parameters (in idc) where I can determine the number of items per line in the representation
                 # of structure in the data segments.
                 if not ida_bytes.get_flags(vtable_entry.entry_ea) & ida_bytes.FF_QWORD:
-                    self.log.error(f'{vtable_entry.entry_ea:#x} is not a QWORD data type!')
+                    # The vtable may be typed as one struct. Per-slot colors are not
+                    # possible then, but the typed listing is more useful.
+                    self.log.debug(f'{vtable_entry.entry_ea:#x} is not a QWORD data type; skipping color')
                     continue
 
                 ida_nalt.set_item_color(vtable_entry.entry_ea, bgcolor)

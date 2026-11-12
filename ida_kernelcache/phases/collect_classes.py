@@ -12,10 +12,19 @@ a kernel that IDA's ARM64 decompiler couldn't fully digest. We now delegate clas
 `ipsw kernel cpp --json`, which parses the kernelcache directly and hands us the complete class
 graph (see ida_kernelcache.ida_helpers.ipsw).
 """
+import collections
+import re
+
+import idautils
+import idc
+import ida_hexrays
+import ida_xref
+
 from .base_phase import BasePhase
 from ida_kernelcache import rtti
+from ida_kernelcache.exceptions import PhaseException
 from ida_kernelcache.utils import OneToOneMapFactory
-from ida_kernelcache.ida_helpers import ipsw
+from ida_kernelcache.ida_helpers import decompiler, functions, ipsw, names, strings
 
 
 class CollectClasses(BasePhase):
@@ -36,6 +45,8 @@ class CollectClasses(BasePhase):
 
         # Collect associations from class names to metaclass instances and vice versa.
         self._metaclass_to_classname_builder = OneToOneMapFactory()
+        # metaclass_ea -> address of the MetaClass helper vtable, when the source provides it
+        self._metaclass_to_metavtable_ea: dict[int, int] = {}
         self._metaclass_to_class_size = {}
         self._metaclass_to_super_metaclass = {}
         self._blacklisted: set[str] = set()
@@ -48,13 +59,22 @@ class CollectClasses(BasePhase):
         # Clear out old class information
         self._kc.class_info_map.clear()
         self._kc.metaclass_to_vtable_ea.clear()
+        self._kc.metaclass_to_metavtable_ea.clear()
 
-        self._load_from_ipsw()
+        try:
+            self._load_from_ipsw()
+            self._source = 'ipsw'
+        except PhaseException as ex:
+            self.log.warning(f'ipsw class graph unavailable ({ex}); falling back to native RTTI decoding')
+            self._load_from_native()
+            self._source = 'native'
+
         self._populate_class_info_map()
+        self._kc.metaclass_to_metavtable_ea.update(self._metaclass_to_metavtable_ea)
 
         # Print statistics
         self.log.info(f'Collection stats:\n'
-                      f'* classes from ipsw:{self._num_succeeded}\n'
+                      f'* classes from {self._source}:{self._num_succeeded}\n'
                       f'* dropped in one-to-one map:{self._num_dropped_in_one_to_one_map}\n'
                       f'* blacklisted:{len(self._blacklisted)}\n'
                       f'* classes:{len(self._kc.class_info_map)}\n')
@@ -73,6 +93,7 @@ class CollectClasses(BasePhase):
             class_size = entry['Size']
             super_metaclass_ea = entry['SuperMeta']
             vtable_addr = entry['VtableAddr']
+            metavtable_addr = entry.get('MetaVtableAddr', 0)
 
             if not metaclass_ea:
                 self.log.warning(f'Skipping {class_name}: ipsw reported a null MetaPtr')
@@ -90,7 +111,121 @@ class CollectClasses(BasePhase):
             if vtable_addr:
                 self._kc.metaclass_to_vtable_ea[metaclass_ea] = vtable_addr
 
+            if metavtable_addr:
+                self._metaclass_to_metavtable_ea[metaclass_ea] = metavtable_addr
+
             self._num_succeeded += 1
+
+    def _load_from_native(self):
+        """
+        Fallback when `ipsw` is not available.
+
+        Decode every call to OSMetaClass::OSMetaClass and read its four arguments from
+        the Hex-Rays ctree. KEXTs call the constructor through a `j_` auth stub, so
+        follow one stub level.
+        """
+        ctor_ea = self._find_osmetaclass_constructor()
+        self._var_expr_errors: dict[str, set[int]] = collections.defaultdict(set)
+        # callsite_ea -> the callee the call targets (the constructor or its auth stub)
+        callsites: dict[int, int] = {}
+
+        for xref_ea in idautils.CodeRefsTo(ctor_ea, flow=False):
+            func_ea = functions.get_func_start(xref_ea, raise_error=False)
+            if func_ea != idc.BADADDR and self._is_auth_stub(func_ea):
+                for stub_xref in idautils.CodeRefsTo(func_ea, flow=False):
+                    callsites[stub_xref] = func_ea
+            else:
+                callsites[xref_ea] = ctor_ea
+
+        # KEXTs call the constructor through their own auth stub, which does not
+        # reference the constructor directly. Walk every OSMetaClass stub.
+        for func_ea in idautils.Functions():
+            name = idc.get_func_name(func_ea)
+            if name.startswith('j_') and 'OSMetaClassC2E' in name:
+                for stub_xref in idautils.CodeRefsTo(func_ea, flow=False):
+                    callsites[stub_xref] = func_ea
+
+        for callsite_ea, callee_ea in sorted(callsites.items()):
+            try:
+                if self._handle_callsite(callee_ea, callsite_ea):
+                    self._num_succeeded += 1
+            except Exception as ex:
+                self.log.debug(f'Failed to decode OSMetaClass call at {callsite_ea:#x}: {ex}')
+
+        for classname, eas in self._var_expr_errors.items():
+            if classname not in self._kc.class_info_map and classname not in self._blacklisted:
+                self.log.debug(f'Unresolved class {classname} at {", ".join(f"{ea:#x}" for ea in eas)}')
+
+        self.log.info(f'Native RTTI decoding: {self._num_succeeded} classes from {len(callsites)} call sites')
+
+    @staticmethod
+    def _is_auth_stub(func_ea: int) -> bool:
+        return idc.get_func_name(func_ea).startswith('j_')
+
+    def _find_osmetaclass_constructor(self) -> int:
+        """Locate OSMetaClass::OSMetaClass by symbol, or by the first reference to "OSObject"."""
+        for candidate in ('__ZN11OSMetaClassC2EPKcPKS_j', '_ZN11OSMetaClassC2EPKcPKS_j'):
+            ea = names.get_name_ea(candidate)
+            if ea != idc.BADADDR:
+                return functions.get_func_start(ea)
+
+        osobject_str_ea = strings.find_str('OSObject').ea
+        xref_ea = ida_xref.get_first_dref_to(osobject_str_ea)
+        if xref_ea != idc.BADADDR:
+            cfunc = ida_hexrays.decompile(xref_ea)
+            if cfunc is not None:
+                visitor = decompiler.FindCallByArgVisitor(osobject_str_ea)
+                visitor.apply_to(cfunc.body, parent=None)
+                if visitor.found:
+                    return visitor.func_ea
+
+        raise PhaseException('Could not locate OSMetaClass::OSMetaClass; install ipsw or fix symbols')
+
+    def _handle_callsite(self, ctor_ea: int, callsite_ea: int) -> bool:
+        args_ops = [
+            (ida_hexrays.cot_cast, ida_hexrays.cot_ref, ida_hexrays.cot_var, ida_hexrays.cot_obj),
+            (ida_hexrays.cot_obj,),
+            (ida_hexrays.cot_cast, ida_hexrays.cot_ref, ida_hexrays.cot_num, ida_hexrays.cot_obj),
+            (ida_hexrays.cot_num,)
+        ]
+
+        visitor = decompiler.FindCallVisitor(ctor_ea, callsite_ea, args_ops)
+        cfunc = ida_hexrays.decompile(callsite_ea)
+        if cfunc is None:
+            return False
+        visitor.apply_to(cfunc.body, parent=None)
+        if not visitor.found or not visitor.passed_ops_validation:
+            return False
+
+        classname_ea = visitor.args[1].obj_ea
+        classname = idc.get_strlit_contents(classname_ea)
+        if not classname:
+            return False
+        classname_str = classname.decode(errors='replace')
+
+        metaclass_arg = decompiler.traverse_casts_or_ref_branch(visitor.args[0])
+        if metaclass_arg.op == ida_hexrays.cot_var:
+            self._var_expr_errors[classname_str].add(callsite_ea)
+            return False
+        if metaclass_arg.op != ida_hexrays.cot_obj:
+            return False
+        metaclass_ea = metaclass_arg.obj_ea
+
+        super_arg = decompiler.traverse_casts_or_ref_branch(visitor.args[2])
+        if super_arg.op == ida_hexrays.cot_num and not super_arg.numval():
+            super_metaclass_ea = 0
+        elif super_arg.op == ida_hexrays.cot_obj:
+            super_metaclass_ea = super_arg.obj_ea
+        else:
+            return False
+
+        class_size = visitor.args[3].numval()
+        self._metaclass_to_classname_builder.add_link(metaclass_ea, classname_str)
+        self._metaclass_to_class_size[metaclass_ea] = class_size
+        if super_metaclass_ea:
+            self._metaclass_to_super_metaclass[metaclass_ea] = super_metaclass_ea
+        self.log.debug(f'Found metaclass info for {classname_str} at {callsite_ea:#x}')
+        return True
 
     def _populate_class_info_map(self):
         """

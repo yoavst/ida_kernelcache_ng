@@ -1,44 +1,19 @@
 import dataclasses
-import plistlib
-import re
 import time
 
 import ida_auto
 import ida_segment
 import idaapi
 import ida_kernwin
-import idc
 import logging
-from ida_kernelcache import (
-    kplist, rtti, consts,
-)
+from ida_kernelcache import rtti, consts
 from ida_kernelcache.exceptions import PhaseException
 from ida_kernelcache.phases import ALL_PHASES
+from ida_kernelcache.ida_helpers import kcu
 from ida_kernelcache.ida_helpers.abstractions import Segment
 
 logging.basicConfig(format='%(levelname)-10s %(name)s: %(message)s', level=logging.INFO)
 log = logging.getLogger(__name__)
-
-
-@dataclasses.dataclass
-class Kext:
-    name: str
-    load_addr: int
-    size: int
-    end_addr: int = dataclasses.field(init=False)
-    bad_addr: bool = dataclasses.field(init=False)
-
-    def __post_init__(self):
-        self.bad_addr = self.load_addr == 0x7fffffffffffffff
-        self.end_addr = self.load_addr + self.size
-
-    def __lt__(self, other):
-        if not isinstance(other, self.__class__):
-            raise TypeError(f'Kext < {type(other)} not supported')
-        return self.load_addr < other.load_addr
-
-    def __repr__(self):
-        return f'Kext(name={self.name}, load_addr={self.load_addr:#x}, end_addr={self.end_addr:#x})'
 
 
 class KernelCache(object):
@@ -59,7 +34,6 @@ class KernelCache(object):
         """
         super().__init__()
         self._base = None
-        self._prelink_info = None
 
         # TODO: make this persistent?
         self.rtti_db = rtti.RTTIDatabase()
@@ -71,9 +45,10 @@ class KernelCache(object):
         # Populated by CollectClasses from the ipsw `VtableAddr` field and consumed by CollectVtables.
         # Maps metaclass_ea -> the address of the first vmethod of the class vtable (ipsw VtableAddr).
         self.metaclass_to_vtable_ea: dict[int, int] = {}
+        # metaclass_ea -> address of the class's MetaClass helper vtable
+        self.metaclass_to_metavtable_ea: dict[int, int] = {}
 
         self.segments_list: list[Segment] = []
-        self._kexts: list[Kext] = []
 
         for i in range(ida_segment.get_segm_qty()):
             swig_segment = ida_segment.getnseg(i)
@@ -95,56 +70,6 @@ class KernelCache(object):
 
         return self._base
 
-    @property
-    def prelink_info(self):
-        """
-        Find and parse the kernel __PRELINK_INFO dictionary.
-        """
-        if self._prelink_info is None:
-
-            # Find all candidate __PRELINK_INFO segments (or sections).
-            # We try to identify any IDA segments with __PRELINK_INFO in the name so that this function will
-            # work both before and after automatic rename. A more reliable method would be parsing the Mach-O.
-            try:
-                prelink_segment = next(s for s in self.segments_list if '__PRELINK_INFO' in s.name)
-            except StopIteration:
-                log.error('Could not find any __PRELINK_INFO segment candidates')
-                return None
-
-            prelink_info_string = idc.get_bytes(prelink_segment.start_ea, prelink_segment.size)
-            if prelink_info_string != None:
-                if prelink_info_string[:5] == b"<dict":
-                    prelink_info_string = prelink_info_string.replace(b"\x00", b"")
-                    prelink_info_string = prelink_info_string.decode()
-                    self._prelink_info = kplist.kplist_parse(prelink_info_string)
-                elif prelink_info_string.startswith(b"<?xml version=\"1.0\""):
-                    self._prelink_info = plistlib.loads((prelink_info_string.rstrip(b"\x00")))
-
-            if self._prelink_info is None:
-                log.error('Failed to parse __PRELINK_INFO')
-
-        return self._prelink_info
-
-    def segments_matching(self, pattern: str) -> tuple[Segment, None, None]:
-        for s in self.segments_list:
-            if re.match(pattern, s.name, flags=re.IGNORECASE):
-                yield s
-
-    @property
-    def kexts(self) -> list[Kext]:
-        if self._kexts:
-            return self._kexts
-
-        if self.prelink_info:
-            for info in self.prelink_info['_PrelinkInfoDictionary']:
-                bundle_identifier = info['CFBundleIdentifier']
-                load_addr = info['_PrelinkExecutableLoadAddr'] & 0xFFFFFFFFFFFFFFFF
-                size = info.get('_PrelinkExecutableSize', 0)
-                self._kexts.append(Kext(bundle_identifier, load_addr, size))
-        else:
-            log.warning('Kext list is empty because no prelink info is available')
-        return self._kexts
-
     @staticmethod
     def is_supported() -> bool:
         """
@@ -155,6 +80,10 @@ class KernelCache(object):
         if idaapi.IDA_SDK_VERSION < consts.MIN_IDA_SDK_VERSION:
             log.error('Unsupported IDA version. The minimum requirement is to run IDA 9.0!')
             return False
+
+        # IDA 9.5's kernelcache loader is the authoritative check.
+        if kcu.is_available():
+            return True
 
         file_type = idaapi.get_file_type_name()
         if ('Mach-O' not in file_type and 'kernelcache' not in file_type) or 'ARM64' not in file_type:

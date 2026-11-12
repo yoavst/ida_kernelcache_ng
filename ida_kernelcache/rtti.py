@@ -533,7 +533,8 @@ class RTTIDatabase:
     def __init__(self):
         self.class_info_map = ClassInfoMap()
         self.vmethod_info_map = VMethodInfoMap()
-        self.persistent_path = pathlib.Path(ida_nalt.get_input_file_path() + self.RTTI_DB_SUFFIX)
+        input_path = ida_nalt.get_input_file_path() or ida_nalt.get_root_filename() or 'kernelcache'
+        self.persistent_path = pathlib.Path(input_path + self.RTTI_DB_SUFFIX)
 
     def save(self):
         class_dicts = []

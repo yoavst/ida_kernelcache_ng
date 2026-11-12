@@ -11,9 +11,14 @@ INITIAL_NUM_VTABLE_METHODS = 7
 
 # Related to C++ name mangling and symbols
 OSMETACLASS_CTOR_SYMBOL = '__ZN11OSMetaClassC2EPKcPKS_j'
-GLOBAL_METACLASS_INSTANCE_NAME = 'gMetaclass'
+GLOBAL_METACLASS_INSTANCE_NAME = 'gMetaClass'
 # Scope resolution operator
 CXX_SCOPE = '::'
+
+# IDA 9.5 names these objects itself. Use the same spelling to avoid duplicates.
+METACLASS_INSTANCE_NAME_TEMPLATE = '{class_name}::gMetaClass'
+VTABLE_NAME_TEMPLATE = '{class_name}::vtable'
+METACLASS_VTABLE_NAME_TEMPLATE = '{class_name}::MetaClass::vtable'
 
 # Related to CreateTypes
 CXA_PURE_VIRTUAL = '__cxa_pure_virtual'
@@ -23,6 +28,8 @@ FIELD_SEP = '\n    '
 VIRTUAL_FUNC_TEMPLATE = '__int64 (__fastcall *{func_name})({func_sig}); ///< {vmethod_ea:#x}'
 VPTR_FIELD = 'void *__vftable;'
 DATA_FIELD_TEMPLATE = '__int64 field_{offset:#04x};'
+PTR_FIELD_TEMPLATE = 'void *ptr_{offset:02x};'
+DATA_FIELD_TEMPLATE_HEX = 'unsigned __int64 data_{offset:02x};'
 
 # TODO: don't need these members in the vtable?
 # unsigned __int64 this_offset;

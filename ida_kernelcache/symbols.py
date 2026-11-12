@@ -236,6 +236,19 @@ def mangle_global_metaclass_instance_name(classname: str) -> str:
     return f'__Z{mangled}'
 
 
+def metaclass_instance_name(classname: str) -> str:
+    """IDA 9.5 spelling: ``X::gMetaClass``."""
+    return consts.METACLASS_INSTANCE_NAME_TEMPLATE.format(class_name=classname)
+
+
+def vtable_name(classname: str) -> str:
+    return consts.VTABLE_NAME_TEMPLATE.format(class_name=classname)
+
+
+def metaclass_vtable_name(classname: str) -> str:
+    return consts.METACLASS_VTABLE_NAME_TEMPLATE.format(class_name=classname)
+
+
 def mangle_vmethod_name(classname: str, method_name: str) -> str:
     """
     For vmethod that we were not able to associate with a symbol during the symbolication phases
