@@ -123,6 +123,8 @@ class ApplyRTTIInfoPhase(BasePhase):
                 num_invalid_func += 1
                 continue
 
+            vmethod_info.refresh_func()
+
             if vmethod_info.multiple_owners:
                 if vmethod_info.mangled_symbol:
                     self.log.warning(f'VMethod {vmethod_ea:#x} has multiple owners and a symbol {vmethod_info.mangled_symbol}!')
@@ -134,16 +136,23 @@ class ApplyRTTIInfoPhase(BasePhase):
                 continue
 
             mangled_symbol = vmethod_info.mangled_symbol
+            auto_generate = mangled_symbol is None
 
-            # No symbol, auto generate one
             if mangled_symbol is None:
+                # Do not replace a real symbol name (for example AppleA7IOP::start)
+                # with a generic vmethod_N name.
+                current_name = idc.get_func_name(vmethod_ea)
+                if current_name and not names.is_auto_generated_name(current_name):
+                    auto_generate = False
+
+            if auto_generate:
                 vmethod_name = consts.VMETHOD_NAME_TEMPLATE.format(index=vmethod_info.owning_vtable_entry.index)
                 mangled_symbol = symbols.mangle_vmethod_name(vmethod_info.owning_class_name, vmethod_name)
                 num_auto_generated += 1
 
-            # Apply the mangled symbol as the function name at the vmethod address
-            if not ida_name.set_name(vmethod_ea, mangled_symbol, ida_name.SN_FORCE):
-                raise PhaseException(f'Failed to set name {mangled_symbol} at {vmethod_ea:#x}')
+            if mangled_symbol is not None:
+                if not ida_name.set_name(vmethod_ea, mangled_symbol, ida_name.SN_FORCE):
+                    raise PhaseException(f'Failed to set name {mangled_symbol} at {vmethod_ea:#x}')
 
             # Set a function comment indicating the symbol source
             vmethod_func_comment = consts.VMETHOD_FUNC_CMT_TEMPLATE.format(owning_class=vmethod_info.owning_class_name,

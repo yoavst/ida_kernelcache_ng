@@ -172,6 +172,13 @@ class VMethodInfo:
         assert not self.multiple_owners, 'Getting the owning class name of a vmethod that has multiple owners is not supported yet'
         return self.owning_vtable_entry.vtable_info.class_info.class_name
 
+    def refresh_func(self) -> None:
+        """Resolve the function again; boundaries may have been fixed after construction."""
+        if functions.is_function_start(self.vmethod_ea):
+            self.func = ida_funcs.get_func(self.vmethod_ea)
+        else:
+            self.func = None
+
     def __hash__(self):
         return hash(self.vmethod_ea)
 

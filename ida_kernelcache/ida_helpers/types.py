@@ -98,6 +98,10 @@ class LocalType:
         if self.tif.set_udm_type(index, member_tif):
             raise LocalTypeError(f'Failed to change type of member of {self.type_name} at index {index} decl {type_decl}')
 
+        # set_udm_type only edits the in-memory copy; save it back by name.
+        if self.tif.set_named_type(None, self.type_name, ida_typeinf.NTF_REPLACE) != ida_typeinf.TERR_OK:
+            raise LocalTypeError(f'Failed to save type {self.type_name} after member {index} update')
+
     def set_member_comment(self, index: int, comment: str):
         if self.tif.set_udm_cmt(index, comment):
             raise LocalTypeError(f'Failed to set member comment of {self.type_name} member {index}')

@@ -1,5 +1,6 @@
 import idautils
 import idc
+import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_ua
@@ -106,9 +107,7 @@ class CollectVtables(BasePhase):
                 self.log.debug(f'{class_info.class_name}::getMetaClass has {len(candidates)} const xrefs')
                 continue
 
-            # The data ref points at slot 7. Header is 72 bytes before it; the first
-            # method (the address IDA uses) is 16 bytes after the header.
-            start_ea = candidates[0] - consts.VTABLE_GETMETACLASS_OFFSET + consts.VTABLE_FIRST_METHOD_OFFSET
+            start_ea = self._vtable_start_from_slot(candidates[0], metaclass_ea)
             self._kc.metaclass_to_vtable_ea[metaclass_ea] = start_ea
             self.log.debug(f'{class_info.class_name} vtable first slot {start_ea:#x}')
             num_found += 1
@@ -116,6 +115,35 @@ class CollectVtables(BasePhase):
         self.log.info(f'Located {num_found} vtables through ::getMetaClass, {num_missing} classes without one')
         if not num_found:
             raise PhaseException('Could not locate any vtable; install ipsw for the class/vtable graph')
+
+    @staticmethod
+    def _is_vtable_header(header_ea: int) -> bool:
+        if header_ea < 0:
+            return False
+        first = ida_bytes.get_qword(header_ea)
+        second = ida_bytes.get_qword(header_ea + 8)
+        return first == 0 and second == 0
+
+    def _vtable_start_from_slot(self, slot_ea: int, metaclass_ea: int) -> int:
+        """
+        Resolve the data reference to the vtable's first slot.
+
+        Normally the reference points at ``getMetaClass`` (slot 7), but IDA may also
+        pick a slot-0 thunk that references the metaclass. Check the 16-byte header
+        before and after the two candidate positions.
+        """
+        # The reference is already slot 0.
+        if self._is_vtable_header(slot_ea - consts.VTABLE_FIRST_METHOD_OFFSET):
+            return slot_ea
+
+        # The reference is slot 7 (getMetaClass); first slot is 56 bytes lower.
+        start_ea = slot_ea - consts.VTABLE_GETMETACLASS_OFFSET + consts.VTABLE_FIRST_METHOD_OFFSET
+        if self._is_vtable_header(start_ea - consts.VTABLE_FIRST_METHOD_OFFSET):
+            return start_ea
+
+        self.log.warning(f'Vtable header not found for metaclass {metaclass_ea:#x}; '
+                         f'using first-slot estimate {start_ea:#x}')
+        return start_ea
 
     def _find_getmetaclass_method(self, metaclass_ea: int) -> int:
         candidates: set[int] = set()

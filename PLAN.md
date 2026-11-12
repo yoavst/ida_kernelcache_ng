@@ -76,3 +76,13 @@ Measured facts this plan is based on:
   decompiler is weaker than ipsw; use ipsw when it is installed.
 - Parser note: IDA 9.5 rejects `__hidden` in a struct member declaration. The
   vtable member parameter is named `self` instead.
+- Follow-up verification on the same subset:
+  - Native vtable lookup now checks the 16-byte header, so `OSArray::vtable`
+    resolves to `0xfffffff007c350f8` (was 0x38 early).
+  - Root `__vftable` is persisted: `AppleIOP.__vftable` is `AppleIOP_vtbl *`.
+  - Symbolicated vmethods get a prototype (`Class *self, <mangled args>`) and
+    keep their real name. `AppleA7IOP::start` decompiles as
+    `__int64 AppleA7IOP::start(AppleA7IOP *self, IOService *a2)`.
+  - Virtual calls now resolve to named vtable slots of the static base type
+    (`AppleIOP_vtbl`), not raw `*(_QWORD *)a1 + N` offsets.
+  - Auto-generated `vmethod_N` names no longer overwrite real symbol names.

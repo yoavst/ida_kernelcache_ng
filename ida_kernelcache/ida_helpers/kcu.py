@@ -25,15 +25,17 @@ GRANULE_DUAL = 0x4
 GRANULE_PAC = 0x8
 
 _service = None
-_service_checked = False
 
 
 def service():
-    """Return the shared kcu service, or None when it is unavailable."""
-    global _service, _service_checked
-    if _service_checked:
+    """Return the shared kcu service, or None when it is unavailable.
+
+    A failed lookup is not cached: the plugin initializes before the loader has
+    bootstrapped the service, so later calls must be able to retry.
+    """
+    global _service
+    if _service is not None:
         return _service
-    _service_checked = True
     if ida_kcu is None:
         return None
     try:

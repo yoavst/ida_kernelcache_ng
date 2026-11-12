@@ -9,7 +9,7 @@ import idc
 
 from ida_kernelcache import consts, symbols
 from ida_kernelcache.exceptions import FailedToCreateTypeError, PhaseException
-from ida_kernelcache.ida_helpers import kcu, types
+from ida_kernelcache.ida_helpers import functions, kcu, types
 
 from .base_phase import BasePhase
 
@@ -132,10 +132,12 @@ class CreateTypes(BasePhase):
                 func_name = consts.VMETHOD_NAME_TEMPLATE.format(index=vtable_entry.index)
 
             func_names.add(func_name)
+            func_sig = self._slot_signature(class_info, vtable_entry)
             func_decls.append(consts.VIRTUAL_FUNC_TEMPLATE.format(
                 func_name=func_name,
-                func_sig=f'{class_info.class_name} *self',
+                func_sig=func_sig,
                 vmethod_ea=vtable_entry.vmethod_ea))
+            self._apply_slot_prototype(vtable_entry, func_sig)
 
         vtbl_type_name = self._vtbl_type_name(class_info)
         vtbl_type_decl = consts.VTABLE_DECL_TEMPLATE.format(
@@ -152,19 +154,54 @@ class CreateTypes(BasePhase):
         self.log.debug(f'Created vtable type for {class_info.class_name}! ordinal: {vtable_local_type.ordinal}')
         return conflicts
 
+    @staticmethod
+    def _slot_signature(class_info, vtable_entry) -> str:
+        """Build the slot signature, adding real arguments from the mangled symbol."""
+        func_sig = f'{class_info.class_name} *self'
+        mangled = vtable_entry.vmethod_info.mangled_symbol if vtable_entry.vmethod_info else None
+        if not mangled:
+            return func_sig
+        try:
+            extra_args = symbols.method_arguments_string(mangled)
+        except Exception:
+            return func_sig
+        if extra_args and extra_args != 'void':
+            extra_args = re.sub(r'(?<=[\w>])([*&])', r' \1', extra_args)
+            return f'{func_sig}, {extra_args}'
+        return func_sig
+
+    @staticmethod
+    def _apply_slot_prototype(vtable_entry, func_sig: str) -> None:
+        """Type the function's ``this`` and arguments from the vtable slot."""
+        if not vtable_entry.vmethod_info or not vtable_entry.vmethod_info.mangled_symbol:
+            return
+        # Inherited slots point at the base method; do not retype it with this class.
+        if vtable_entry.inherited or vtable_entry.pure_virtual:
+            return
+        if vtable_entry.vmethod_info.owning_vtable_entry is not vtable_entry:
+            return
+        ea = vtable_entry.vmethod_ea
+        if not functions.is_function_start(ea):
+            return
+        tif = ida_typeinf.tinfo_t()
+        decl = f'__int64 __fastcall prot({func_sig});'
+        # parse_decl may return an error string even when it built a usable type.
+        ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL)
+        if not tif.empty():
+            ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
+
     def _ensure_class_type(self, class_info) -> str:
         """Create, rebuild or keep the class type. Returns 'created', 'rebuilt' or 'kept'."""
         existing = types.get_udt_info(class_info.class_name)
 
         if existing is not None:
-            has_base = bool(existing.base_type)
-            if existing.is_cppobj and has_base and existing.size >= class_info.class_size:
+            # A real C++ type from IDA's type library is authoritative. IDA itself
+            # keeps the type library layout when it differs from the allocation size.
+            if existing.is_cppobj and (existing.base_type or not class_info.is_subclass()):
+                if existing.size != class_info.class_size:
+                    self.log.warning(f'{class_info.class_name} type size {existing.size:#x} != '
+                                     f'metaclass size {class_info.class_size:#x}; keeping the type')
                 return 'kept'
-            if existing.is_cppobj and not class_info.is_subclass() and existing.size >= class_info.class_size:
-                return 'kept'
-            if existing.is_cppobj and has_base and existing.size < class_info.class_size:
-                self.log.warning(f'{class_info.class_name} exists with size {existing.size:#x}, '
-                                 f'metaclass says {class_info.class_size:#x}; rebuilding')
 
         class_type_decl = self._class_type_decl(class_info)
         self._create_type_from_decl(class_info, class_type_decl, replace=existing is not None)
@@ -208,7 +245,12 @@ class CreateTypes(BasePhase):
         so slice the signature at the superclass size. Without a descriptor, use a
         plain 8-byte field.
         """
-        start_offset = class_info.superclass.class_size if class_info.is_subclass() else consts.WORD_SIZE
+        if class_info.is_subclass():
+            super_info = types.get_udt_info(class_info.superclass.class_name)
+            start_offset = super_info.size if super_info is not None else class_info.superclass.class_size
+            start_offset = min(start_offset, class_info.class_size)
+        else:
+            start_offset = consts.WORD_SIZE
         view = None
         if kcu.is_available():
             view = kcu.best_kalloc_view(class_info.class_name, class_info.class_size)

@@ -1,3 +1,5 @@
+import re
+
 import idaapi
 import idc
 import ida_bytes
@@ -80,6 +82,14 @@ def set_ea_name(ea, name, rename=False, auto=False):
     if auto:
         flags |= idc.SN_AUTO
     return bool(idc.set_name(ea, name, flags))
+
+
+_AUTO_NAME_RE = re.compile(r'^(sub_|nullsub_|unknown|loc_|byte_|word_|dword_|qword_|off_|unk_|stru_)')
+
+
+def is_auto_generated_name(name: str) -> bool:
+    """True for IDA-generated names such as ``sub_FFFFFFF00827562C``."""
+    return bool(_AUTO_NAME_RE.match(name or ''))
 
 
 def demangle(mangled_symbol: str) -> str:
