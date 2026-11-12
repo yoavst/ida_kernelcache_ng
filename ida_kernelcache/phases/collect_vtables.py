@@ -1,9 +1,14 @@
+import idautils
 import idc
+import ida_bytes
+import ida_funcs
+import ida_hexrays
+import ida_ua
+import ida_xref
 
 from ida_kernelcache import consts, rtti
 from ida_kernelcache.exceptions import PhaseException
-from ida_kernelcache.ida_helpers import generators, functions, names, strings
-import ida_xref
+from ida_kernelcache.ida_helpers import decompiler, generators, functions, kcu, names, strings
 from .base_phase import BasePhase
 
 
@@ -29,6 +34,8 @@ class CollectVtables(BasePhase):
             raise PhaseException(f"There are no entries in the KernelCache.classes dictionary.. consider running CollectClasses phase before {self.__class__}")
 
         self._handle_pure_virtual()
+        if not self._kc.metaclass_to_vtable_ea:
+            self._collect_vtable_addresses_native()
         self._mark_optimized_classes()
         self._collect_vtables_new()
 
@@ -38,20 +45,26 @@ class CollectVtables(BasePhase):
         self.log.warning(f'There are {len(self._not_functions_set)} virtual methods with wrong function boundaries')
 
     def _handle_pure_virtual(self):
-        str_ea = strings.find_str(consts.CXA_PURE_VIRTUAL).ea
-        candidate = ida_xref.get_first_dref_to(str_ea)
-        if candidate == idc.BADADDR:
-            raise PhaseException(f'Could not find {consts.CXA_PURE_VIRTUAL} string reference!')
+        # IDA 9.5 names the trap function itself. Fall back to the string xref.
+        cxa_pure_virtual_ea = names.get_name_ea(consts.CXA_PURE_VIRTUAL)
+        if cxa_pure_virtual_ea != idc.BADADDR:
+            cxa_pure_virtual_ea = functions.get_func_start(cxa_pure_virtual_ea)
+        else:
+            str_ea = strings.find_str(consts.CXA_PURE_VIRTUAL).ea
+            candidate = ida_xref.get_first_dref_to(str_ea)
+            if candidate == idc.BADADDR:
+                raise PhaseException(f'Could not find {consts.CXA_PURE_VIRTUAL} string reference!')
 
-        if ida_xref.get_next_dref_to(str_ea, candidate) != idc.BADADDR:
-            raise PhaseException(f'{consts.CXA_PURE_VIRTUAL} string has more than 1 xref!')
+            if ida_xref.get_next_dref_to(str_ea, candidate) != idc.BADADDR:
+                raise PhaseException(f'{consts.CXA_PURE_VIRTUAL} string has more than 1 xref!')
 
-        cxa_pure_virtual_ea = functions.get_func_start(candidate)
+            cxa_pure_virtual_ea = functions.get_func_start(candidate)
+
         self.log.info(f'Found {consts.CXA_PURE_VIRTUAL} at {cxa_pure_virtual_ea:#x}')
         new_func_name = f'_{consts.CXA_PURE_VIRTUAL}'
 
         if not names.set_ea_name(cxa_pure_virtual_ea, new_func_name):
-            self.log.error(f'Failed to change the function name at {cxa_pure_virtual_ea:#x} to {new_func_name}')
+            self.log.debug(f'Could not rename {consts.CXA_PURE_VIRTUAL} at {cxa_pure_virtual_ea:#x}')
 
         # Store this information in the VtableInfo class, this will be used when constructing the VtableEntry instances
         rtti.VtableInfo.CXA_PURE_VIRTUAL_EA = cxa_pure_virtual_ea
@@ -70,6 +83,118 @@ class CollectVtables(BasePhase):
                 self.log.debug(f'Marked {class_info.class_name} metaclass_ea:{class_info.metaclass_ea:#x} as optimized without a vtable')
         self.log.info(f'Marked {num_optimized}/{len(self._kc.class_info_map)} classes as optimized (no vtable)')
 
+    def _collect_vtable_addresses_native(self):
+        """
+        Fill ``metaclass_to_vtable_ea`` without ipsw.
+
+        Every class has a ``::getMetaClass`` method that returns its metaclass. That
+        method appears once in the class vtable, at index 7. Find the method, then the
+        single ``__const`` data reference to it, and derive the first slot.
+        """
+        self.log.info('No vtable addresses from ipsw; locating them through ::getMetaClass references')
+        num_found = 0
+        num_missing = 0
+        for metaclass_ea, class_info in self._kc.class_info_map.items_by_type(key_type=int):
+            getmetaclass_ea = self._find_getmetaclass_method(metaclass_ea)
+            if getmetaclass_ea == idc.BADADDR:
+                num_missing += 1
+                self.log.debug(f'Could not find {class_info.class_name}::getMetaClass')
+                continue
+
+            candidates = list(generators.DataRefsToWithSegmentFilter(getmetaclass_ea, r'.*__const$'))
+            if len(candidates) != 1:
+                num_missing += 1
+                self.log.debug(f'{class_info.class_name}::getMetaClass has {len(candidates)} const xrefs')
+                continue
+
+            start_ea = self._vtable_start_from_slot(candidates[0], metaclass_ea)
+            self._kc.metaclass_to_vtable_ea[metaclass_ea] = start_ea
+            self.log.debug(f'{class_info.class_name} vtable first slot {start_ea:#x}')
+            num_found += 1
+
+        self.log.info(f'Located {num_found} vtables through ::getMetaClass, {num_missing} classes without one')
+        if not num_found:
+            raise PhaseException('Could not locate any vtable; install ipsw for the class/vtable graph')
+
+    @staticmethod
+    def _is_vtable_header(header_ea: int) -> bool:
+        if header_ea < 0:
+            return False
+        first = ida_bytes.get_qword(header_ea)
+        second = ida_bytes.get_qword(header_ea + 8)
+        return first == 0 and second == 0
+
+    def _vtable_start_from_slot(self, slot_ea: int, metaclass_ea: int) -> int:
+        """
+        Resolve the data reference to the vtable's first slot.
+
+        Normally the reference points at ``getMetaClass`` (slot 7), but IDA may also
+        pick a slot-0 thunk that references the metaclass. Check the 16-byte header
+        before and after the two candidate positions.
+        """
+        # The reference is already slot 0.
+        if self._is_vtable_header(slot_ea - consts.VTABLE_FIRST_METHOD_OFFSET):
+            return slot_ea
+
+        # The reference is slot 7 (getMetaClass); first slot is 56 bytes lower.
+        start_ea = slot_ea - consts.VTABLE_GETMETACLASS_OFFSET + consts.VTABLE_FIRST_METHOD_OFFSET
+        if self._is_vtable_header(start_ea - consts.VTABLE_FIRST_METHOD_OFFSET):
+            return start_ea
+
+        self.log.warning(f'Vtable header not found for metaclass {metaclass_ea:#x}; '
+                         f'using first-slot estimate {start_ea:#x}')
+        return start_ea
+
+    def _find_getmetaclass_method(self, metaclass_ea: int) -> int:
+        candidates: set[int] = set()
+        for xref_ea in idautils.DataRefsTo(metaclass_ea):
+            func = ida_funcs.get_func(xref_ea)
+            if func is None or func.size() > 0x20:
+                continue
+            func_start = func.start_ea
+            if self._is_getmetaclass_method(func_start, metaclass_ea):
+                candidates.add(func_start)
+            elif self._is_getmetaclass_method_fallback(func_start, metaclass_ea):
+                candidates.add(func_start)
+
+        if len(candidates) == 1:
+            return candidates.pop()
+        return idc.BADADDR
+
+    @staticmethod
+    def _is_getmetaclass_method(func_ea: int, metaclass_ea: int) -> bool:
+        cfunc = ida_hexrays.decompile(func_ea)
+        if cfunc is None:
+            return False
+        root = cfunc.body
+        if root.op != ida_hexrays.cit_block or len(root.cblock) != 1:
+            return False
+        statement = root.cblock[0]
+        if statement.op != ida_hexrays.cit_return:
+            return False
+        expr = decompiler.traverse_casts_or_ref_branch(statement.creturn.expr)
+        return expr.op == ida_hexrays.cot_obj and expr.obj_ea == metaclass_ea
+
+    def _is_getmetaclass_method_fallback(self, func_ea: int, metaclass_ea: int) -> bool:
+        """
+        Every ::getMetaClass looks like:
+            BTI c
+            ADRL X0, metaclass_ea
+            RET
+        """
+        mnemonics = ['BTI', 'ADRL', 'RET']
+        x0_index = idautils.GetRegisterList().index('X0')
+        for mnemonic, insn in zip(mnemonics, generators.Instructions(func_ea, count=3)):
+            if mnemonic != insn.get_canon_mnem():
+                return False
+            if mnemonic == 'BTI':
+                if insn.Op1.value != 0x63:
+                    return False
+            elif mnemonic == 'ADRL':
+                if insn.Op1.reg != x0_index or insn.Op2.value != metaclass_ea:
+                    return False
+        return True
+
     def _collect_vtables_new(self):
         """
         Iterate the ClassInfo objects top down using BFS and build the VtableInfo for every class that
@@ -86,6 +211,7 @@ class CollectVtables(BasePhase):
 
             # ipsw's VtableAddr == plugin's start_ea (first vmethod)
             vtable_start_ea = self._kc.metaclass_to_vtable_ea[class_info.metaclass_ea]
+            kcu.ensure_kext_loaded_for_ea(vtable_start_ea)
             vtable_ea = vtable_start_ea - consts.VTABLE_FIRST_METHOD_OFFSET
 
             if vtable_ea in self._associated_vtables:

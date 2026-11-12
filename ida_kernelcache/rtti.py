@@ -23,7 +23,7 @@ import idc
 
 from ida_kernelcache import consts, utils
 from ida_kernelcache.exceptions import ClassHasVtableError, VtableHasClassError, PhaseException
-from ida_kernelcache.ida_helpers import generators, functions
+from ida_kernelcache.ida_helpers import generators, functions, paths
 
 log = logging.getLogger(__name__)
 
@@ -171,6 +171,13 @@ class VMethodInfo:
         assert self.owning_vtable_entry, 'Attempting to fetch the owning class name of a vmethod that does not have an owning vtable entry'
         assert not self.multiple_owners, 'Getting the owning class name of a vmethod that has multiple owners is not supported yet'
         return self.owning_vtable_entry.vtable_info.class_info.class_name
+
+    def refresh_func(self) -> None:
+        """Resolve the function again; boundaries may have been fixed after construction."""
+        if functions.is_function_start(self.vmethod_ea):
+            self.func = ida_funcs.get_func(self.vmethod_ea)
+        else:
+            self.func = None
 
     def __hash__(self):
         return hash(self.vmethod_ea)
@@ -533,7 +540,8 @@ class RTTIDatabase:
     def __init__(self):
         self.class_info_map = ClassInfoMap()
         self.vmethod_info_map = VMethodInfoMap()
-        self.persistent_path = pathlib.Path(ida_nalt.get_input_file_path() + self.RTTI_DB_SUFFIX)
+        input_path = paths.input_file_path() or 'kernelcache'
+        self.persistent_path = pathlib.Path(input_path + self.RTTI_DB_SUFFIX)
 
     def save(self):
         class_dicts = []

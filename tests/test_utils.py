@@ -27,7 +27,6 @@ def get_kc(load: bool = True):
 
 
 def groupby_segment(kc) -> dict[str, list[rtti.ClassInfo]]:
-    # counters = {kext.name: 0 for kext in kc.kexts}
     counters = {segment.name: [] for segment in kc.segments_list}
     for class_info in kc.class_info_map.values():
         # kext = kc.get_ea_kext(class_info.metaclass_ea)

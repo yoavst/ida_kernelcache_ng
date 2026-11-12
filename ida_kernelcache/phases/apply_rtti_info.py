@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from .. import rtti
 from ..exceptions import PhaseException
-from ..ida_helpers import strings, functions, decompiler
+from ..ida_helpers import strings, functions, decompiler, kcu
 
 if TYPE_CHECKING:
     from ida_kernelcache.rtti import ClassInfo
@@ -36,11 +36,13 @@ class ApplyRTTIInfoPhase(BasePhase):
 
     def run(self):
         for classname, classinfo in self._kc.class_info_map.items_by_type(str):
+            self._ensure_owning_kext_loaded(classinfo.metaclass_ea)
             self._add_metaclass_instance_symbol(classinfo)
 
             # Only operate on classes that have vtable information
             if classinfo.vtable_info:
                 self._add_vtable_symbol(classinfo)
+                self._add_metaclass_vtable_symbol(classinfo)
 
         self._apply_vmethod_symbols()
 
@@ -70,18 +72,36 @@ class ApplyRTTIInfoPhase(BasePhase):
     def _add_metaclass_instance_symbol(self, classinfo: 'ClassInfo') -> None:
         """
         Add a symbol for the OSMetaClass instance at the specified address.
+
+        IDA 9.5 may have named it already. Keep its name.
         """
-        metaclass_instance_symbol = symbols.mangle_global_metaclass_instance_name(classinfo.class_name)
-        if not names.set_ea_name(classinfo.metaclass_ea, metaclass_instance_symbol, rename=True):
-            self.log.error(f'Failed to set name at {classinfo.metaclass_ea:#x}! wanted {metaclass_instance_symbol}')
+        metaclass_instance_symbol = symbols.metaclass_instance_name(classinfo.class_name)
+        if not names.set_ea_name(classinfo.metaclass_ea, metaclass_instance_symbol):
+            self.log.debug(f'Metaclass symbol at {classinfo.metaclass_ea:#x} not set to {metaclass_instance_symbol}')
+
+    @staticmethod
+    def _ensure_owning_kext_loaded(ea: int) -> None:
+        if kcu.is_available():
+            kcu.ensure_kext_loaded_for_ea(ea)
 
     def _add_vtable_symbol(self, classinfo: 'ClassInfo') -> None:
         """
-        Set a symbol for the virtual method table at the specified address, renaming it if it already exists!
+        Add a symbol for the virtual method table.
+
+        IDA 9.5 names the vtable at the first slot (ipsw ``VtableAddr``), not at
+        the 16-byte header. Keep its name when it exists.
         """
-        mangled_vtable_symbol = symbols.mangle_vtable_name(classinfo.class_name)
-        if not names.set_ea_name(classinfo.vtable_info.vtable_ea, mangled_vtable_symbol, rename=True):
-            self.log.error(f'Failed to set name at {classinfo.vtable_info.vtable_ea:#x}! wanted {mangled_vtable_symbol}')
+        vtable_symbol = symbols.vtable_name(classinfo.class_name)
+        if not names.set_ea_name(classinfo.vtable_info.start_ea, vtable_symbol):
+            self.log.debug(f'Vtable symbol at {classinfo.vtable_info.start_ea:#x} not set to {vtable_symbol}')
+
+    def _add_metaclass_vtable_symbol(self, classinfo: 'ClassInfo') -> None:
+        metavtable_ea = self._kc.metaclass_to_metavtable_ea.get(classinfo.metaclass_ea)
+        if not metavtable_ea:
+            return
+        symbol = symbols.metaclass_vtable_name(classinfo.class_name)
+        if not names.set_ea_name(metavtable_ea, symbol):
+            self.log.debug(f'Metaclass vtable symbol at {metavtable_ea:#x} not set to {symbol}')
 
     def _apply_vmethod_symbols(self) -> None:
         num_invalid_func = 0
@@ -103,6 +123,8 @@ class ApplyRTTIInfoPhase(BasePhase):
                 num_invalid_func += 1
                 continue
 
+            vmethod_info.refresh_func()
+
             if vmethod_info.multiple_owners:
                 if vmethod_info.mangled_symbol:
                     self.log.warning(f'VMethod {vmethod_ea:#x} has multiple owners and a symbol {vmethod_info.mangled_symbol}!')
@@ -114,16 +136,23 @@ class ApplyRTTIInfoPhase(BasePhase):
                 continue
 
             mangled_symbol = vmethod_info.mangled_symbol
+            auto_generate = mangled_symbol is None
 
-            # No symbol, auto generate one
             if mangled_symbol is None:
+                # Do not replace a real symbol name (for example AppleA7IOP::start)
+                # with a generic vmethod_N name.
+                current_name = idc.get_func_name(vmethod_ea)
+                if current_name and not names.is_auto_generated_name(current_name):
+                    auto_generate = False
+
+            if auto_generate:
                 vmethod_name = consts.VMETHOD_NAME_TEMPLATE.format(index=vmethod_info.owning_vtable_entry.index)
                 mangled_symbol = symbols.mangle_vmethod_name(vmethod_info.owning_class_name, vmethod_name)
                 num_auto_generated += 1
 
-            # Apply the mangled symbol as the function name at the vmethod address
-            if not ida_name.set_name(vmethod_ea, mangled_symbol, ida_name.SN_FORCE):
-                raise PhaseException(f'Failed to set name {mangled_symbol} at {vmethod_ea:#x}')
+            if mangled_symbol is not None:
+                if not ida_name.set_name(vmethod_ea, mangled_symbol, ida_name.SN_FORCE):
+                    raise PhaseException(f'Failed to set name {mangled_symbol} at {vmethod_ea:#x}')
 
             # Set a function comment indicating the symbol source
             vmethod_func_comment = consts.VMETHOD_FUNC_CMT_TEMPLATE.format(owning_class=vmethod_info.owning_class_name,

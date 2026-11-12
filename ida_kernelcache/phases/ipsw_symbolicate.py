@@ -5,7 +5,7 @@ import ida_kernwin
 import ida_nalt
 
 from ida_kernelcache import symbols, rtti
-from ida_kernelcache.ida_helpers import names
+from ida_kernelcache.ida_helpers import names, paths
 from .base_phase import BasePhase
 
 
@@ -17,14 +17,14 @@ class IPSWSymbolicate(BasePhase):
 
         self.ipsw_symbols_db: dict[int, str] = {}
 
-        # Search for the ipsw symbolicate database which is stored near kernelcache with a known suffix
-        ipsw_db_path = pathlib.Path(ida_nalt.get_input_file_path() + self.IPSW_DB_SUFFIX)
-        # bin_file = ida_loader.get_path(ida_loader.PATH_TYPE_CMD)
-        # ipsw_db_path = pathlib.Path(bin_file + self.IPSW_DB_SUFFIX)
+        # Search for the ipsw symbolicate database next to the kernelcache.
+        input_path = paths.input_file_path()
+        ipsw_db_path = pathlib.Path(input_path + self.IPSW_DB_SUFFIX) if input_path else None
         self.log.info(f'Searching for IPSW symbols DB at {ipsw_db_path}')
-        if not ipsw_db_path.exists():
+        if ipsw_db_path is None or not ipsw_db_path.exists():
             user_path = ida_kernwin.ask_file(0, 'IPSW Symbols DB|*.symbols.json', 'Enter the IPSW Symbols File')
             if user_path is None:
+                self.log.warning('IPSW symbols DB not found; skipping symbol names')
                 return
             ipsw_db_path = pathlib.Path(user_path)
 

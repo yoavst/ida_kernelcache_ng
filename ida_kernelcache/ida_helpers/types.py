@@ -1,3 +1,5 @@
+import dataclasses
+
 import ida_nalt
 import idc
 import ida_typeinf
@@ -96,6 +98,10 @@ class LocalType:
         if self.tif.set_udm_type(index, member_tif):
             raise LocalTypeError(f'Failed to change type of member of {self.type_name} at index {index} decl {type_decl}')
 
+        # set_udm_type only edits the in-memory copy; save it back by name.
+        if self.tif.set_named_type(None, self.type_name, ida_typeinf.NTF_REPLACE) != ida_typeinf.TERR_OK:
+            raise LocalTypeError(f'Failed to save type {self.type_name} after member {index} update')
+
     def set_member_comment(self, index: int, comment: str):
         if self.tif.set_udm_cmt(index, comment):
             raise LocalTypeError(f'Failed to set member comment of {self.type_name} member {index}')
@@ -153,3 +159,56 @@ class FuncType:
         """
         self.tif.create_func(self.func_details)
         ida_typeinf.apply_tinfo(self.func_ea, self.tif, ida_typeinf.TINFO_DEFINITE)
+
+
+@dataclasses.dataclass(frozen=True)
+class UdtInfo:
+    """Minimal view of an existing UDT, used to decide whether to merge or create."""
+    name: str
+    size: int
+    is_cppobj: bool
+    is_vftable: bool
+    base_type: str = ''   # name of the first base class, empty when there is none
+    base_size: int = 0    # size of that base in bytes
+
+
+def get_udt_info(type_name: str) -> UdtInfo | None:
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(None, type_name) or not tif.is_udt():
+        return None
+
+    udt = ida_typeinf.udt_type_data_t()
+    if not tif.get_udt_details(udt):
+        return None
+
+    base_type = ''
+    base_size = 0
+    for member in udt:
+        if member.is_baseclass():
+            base_type = str(member.type)
+            base_size = member.size // 8
+            break
+
+    is_cppobj = bool(udt.is_cppobj())
+    if not is_cppobj:
+        is_cppobj = bool(tif.get_udt_taudt_bits() & ida_typeinf.TAUDT_CPPOBJ)
+
+    return UdtInfo(name=type_name,
+                   size=tif.get_size(),
+                   is_cppobj=is_cppobj,
+                   is_vftable=bool(tif.is_vftable()),
+                   base_type=base_type,
+                   base_size=base_size)
+
+
+def type_exists(type_name: str) -> bool:
+    tif = ida_typeinf.tinfo_t()
+    return bool(tif.get_named_type(None, type_name))
+
+
+def apply_type_at(ea: int, type_name: str) -> bool:
+    """Apply a named type to the data at ``ea``."""
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(None, type_name):
+        return False
+    return bool(ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE))
